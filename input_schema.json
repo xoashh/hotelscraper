@@ -1,0 +1,46 @@
+{
+    "title": "Hotel Aggregator Input",
+    "type": "object",
+    "schemaVersion": 1,
+    "properties": {
+        "destination": {
+            "title": "Destination",
+            "type": "string",
+            "description": "City or Place name (e.g., 'Goa', 'London', 'Mumbai')",
+            "editor": "textfield",
+            "prefill": "Goa"
+        },
+        "checkInDate": {
+            "title": "Check-in Date",
+            "type": "string",
+            "description": "Format: YYYY-MM-DD",
+            "editor": "datepicker"
+        },
+        "checkOutDate": {
+            "title": "Check-out Date",
+            "type": "string",
+            "description": "Format: YYYY-MM-DD",
+            "editor": "datepicker"
+        },
+        "maxItems": {
+            "title": "Max Items per Site",
+            "type": "integer",
+            "description": "Limit scraped items to speed up the run.",
+            "default": 20,
+            "minimum": 1,
+            "maximum": 100
+        },
+        "proxyConfiguration": {
+            "title": "Proxy Configuration",
+            "type": "object",
+            "editor": "proxy",
+            "description": "Residential proxies (India) are REQUIRED.",
+            "default": {
+                "useApifyProxy": true,
+                "apifyProxyGroups": ["RESIDENTIAL"],
+                "apifyProxyCountry": "IN"
+            }
+        }
+    },
+    "required": ["destination", "checkInDate", "checkOutDate", "proxyConfiguration"]
+}

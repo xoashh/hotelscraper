@@ -1,0 +1,247 @@
+from apify import Actor
+from crawlee.router import Router
+from crawlee.crawlers import PlaywrightCrawlingContext
+from datetime import datetime
+import re
+import asyncio
+
+router = Router[PlaywrightCrawlingContext]()
+
+# --- UTILS ---
+def clean_text(text):
+    if not text: return None
+    cleaned = ' '.join(str(text).strip().split())
+    
+    # 1. Critical: Reject URLs/Paths (Fixes Yatra bug)
+    if "http" in cleaned or "//" in cleaned or ".com" in cleaned or ".jpg" in cleaned: return None
+    
+    # 2. Reject Prices/Numbers
+    if "₹" in cleaned or re.match(r'^[\d,]+$', cleaned): return None
+    
+    # 3. Reject "X rooms left" or "Reviews" patterns
+    if re.search(r'\d+\s+rooms?\s+left', cleaned, re.IGNORECASE): return None
+    if re.search(r'\d+\s+reviews?', cleaned, re.IGNORECASE): return None
+    
+    # 4. Reject UI Noise
+    bad_phrases = [
+        "filters", "sort by", "map", "amenities", "price", "modify", "hotels", 
+        "per night", "view details", "book", "reviews", "star", "rating", "discount", 
+        "off", "sold out", "click", "taxes", "fees", "refund", "free wifi", "breakfast",
+        "candolim", "calangute", "baga", "goa", "india" # Reject pure location names
+    ]
+    if any(phrase == cleaned.lower() for phrase in bad_phrases): return None
+    
+    if len(cleaned) < 4: return None
+    return cleaned
+
+def extract_price(text):
+    if not text: return None
+    nums = re.findall(r'[\d,]+', str(text))
+    return nums[0].replace(',', '') if nums else None
+
+async def extract_image(card):
+    try:
+        img = card.locator('img').first
+        if await img.count() > 0:
+            src = await img.get_attribute('src')
+            if not src or "data:image" in src:
+                src = await img.get_attribute('data-src') or await img.get_attribute('data-lazy')
+            return src or "N/A"
+    except: pass
+    return "N/A"
+
+async def extract_rating(card):
+    try:
+        texts = await card.locator('div, span').all_inner_texts()
+        for t in texts:
+            if re.match(r'^\d(\.\d)?(/\d)?$', t.strip()) and len(t.strip()) < 4:
+                return t.strip()
+    except: pass
+    return "N/A"
+
+async def extract_amenities(card):
+    try:
+        items = await card.locator('ul li, .features, .amenity, span, div').all_inner_texts()
+        valid = [t.strip() for t in items if len(t.strip()) > 3 and len(t.strip()) < 20 and clean_text(t)]
+        # Filter duplicates and return top 3
+        return ", ".join(list(set(valid))[:3])
+    except: return "Standard"
+
+# --- THE "SILVER BULLET" NAME FINDER ---
+async def find_best_name(card):
+    """
+    Scans ALL text in the card and picks the best 'Hotel Name' candidate.
+    Logic: Hotel Name is usually the longest text that isn't a description.
+    """
+    try:
+        # Get every single piece of text in the card
+        texts = await card.locator('*').all_inner_texts()
+        best_name = None
+        max_len = 0
+        
+        for text in texts:
+            cleaned = clean_text(text)
+            if cleaned:
+                # Heuristic: Hotel names are usually 10-60 chars long
+                if len(cleaned) > max_len and len(cleaned) < 65:
+                    # Prefer text that starts with uppercase
+                    if cleaned[0].isupper():
+                        max_len = len(cleaned)
+                        best_name = cleaned
+        return best_name
+    except: return None
+
+# --- HANDLERS ---
+
+@router.handler("BOOKING")
+async def handle_booking(context: PlaywrightCrawlingContext) -> None:
+    page = context.page
+    data = context.request.user_data
+    results = []
+    try:
+        await page.wait_for_selector('[data-testid="property-card"]', timeout=30000)
+        cards = await page.locator('[data-testid="property-card"]').all()
+        for card in cards[:20]:
+            item = {"source": "Booking.com", "destination": data.get('destination'), "check_in": data.get('checkIn'), "check_out": data.get('checkOut')}
+            try:
+                name = await card.locator('[data-testid="title"]').first.inner_text(timeout=2000)
+                price = await card.locator('[data-testid="price-and-discounted-price"]').first.inner_text(timeout=2000)
+                item["hotel_name"] = clean_text(name)
+                item["price_numeric"] = extract_price(price)
+                item["price_display"] = price
+                item["hotel_img"] = await extract_image(card)
+                item["rating"] = await extract_rating(card)
+                item["amenities"] = "Free WiFi"
+                if item.get("hotel_name"): results.append(item)
+            except: continue
+    except: pass
+    if results: await context.push_data(results)
+
+@router.handler("YATRA")
+async def handle_yatra(context: PlaywrightCrawlingContext) -> None:
+    context.log.info("Processing Yatra...")
+    page = context.page
+    data = context.request.user_data
+    results = []
+    try:
+        await page.wait_for_load_state("domcontentloaded")
+        await page.mouse.wheel(0, 3000)
+        await page.wait_for_timeout(2000)
+        
+        # 1. Find Cards by Price Anchors (Most reliable)
+        price_els = await page.locator('text=/₹/').all()
+        
+        seen_names = set()
+        for price_el in price_els[:30]:
+            item = {"source": "Yatra", "destination": data.get('destination'), "check_in": data.get('checkIn'), "check_out": data.get('checkOut')}
+            try:
+                # Go up 3 levels to find the "Card" container
+                card = price_el.locator('xpath=./ancestor::div[3]')
+                
+                # Use Visual Text Analysis to find the name
+                name = await find_best_name(card)
+                price = await price_el.inner_text(timeout=1000)
+
+                item["hotel_name"] = name
+                item["price_numeric"] = extract_price(price)
+                item["price_display"] = price
+                item["hotel_img"] = await extract_image(card)
+                item["rating"] = await extract_rating(card)
+                item["amenities"] = await extract_amenities(card)
+
+                if item.get("hotel_name") and item.get("price_numeric") and item["hotel_name"] not in seen_names:
+                    results.append(item)
+                    seen_names.add(item["hotel_name"])
+            except: continue
+    except: pass
+    if results: await context.push_data(results)
+
+@router.handler("MMT")
+async def handle_mmt(context: PlaywrightCrawlingContext) -> None:
+    context.log.info("Processing MMT...")
+    page = context.page
+    data = context.request.user_data
+    results = []
+    seen = set()
+    try:
+        if "Access Denied" in await page.content(): return
+        try: await page.wait_for_selector('[id^="htl_id"]', timeout=15000)
+        except: pass
+        await page.mouse.wheel(0, 4000)
+        
+        # Standard Selectors
+        cards = await page.locator('[id^="htl_id"], .listingRow').all()
+        
+        # Fallback to Text Anchors if empty
+        if len(cards) == 0:
+            price_els = await page.locator('text=/₹/').all()
+            # MMT nesting is deep, usually 4-5 divs up
+            cards = [p.locator('xpath=./ancestor::div[5]') for p in price_els]
+
+        for card in cards[:25]:
+            item = {"source": "MakeMyTrip", "destination": data.get('destination'), "check_in": data.get('checkIn'), "check_out": data.get('checkOut')}
+            try:
+                # Try ID first (Fastest)
+                name = None
+                if await card.locator('[id*="hotel_name"]').count() > 0:
+                    name = await card.locator('[id*="hotel_name"]').first.inner_text(timeout=1000)
+                else:
+                    # Fallback to Text Analysis
+                    name = await find_best_name(card)
+                
+                # Get Price
+                price = "0"
+                if await card.locator('text=/₹/').count() > 0:
+                    price = await card.locator('text=/₹/').first.inner_text(timeout=1000)
+
+                item["hotel_name"] = clean_text(name)
+                item["price_numeric"] = extract_price(price)
+                item["price_display"] = price
+                item["hotel_img"] = await extract_image(card)
+                item["rating"] = await extract_rating(card)
+                item["amenities"] = await extract_amenities(card)
+                
+                if item["hotel_name"] and item["hotel_name"] not in seen:
+                    results.append(item)
+                    seen.add(item["hotel_name"])
+            except: continue
+    except: pass
+    if results: await context.push_data(results)
+
+@router.handler("CLEARTRIP")
+async def handle_cleartrip(context: PlaywrightCrawlingContext) -> None:
+    context.log.info("Processing Cleartrip...")
+    page = context.page
+    data = context.request.user_data
+    results = []
+    seen = set()
+    try:
+        await page.wait_for_load_state("domcontentloaded")
+        if "Access Denied" in await page.content(): return
+        
+        # Cleartrip Price Anchor Strategy (Most robust for this site)
+        price_els = await page.locator('text=/₹|Rs/').all()
+        
+        for p in price_els:
+            item = {"source": "Cleartrip", "destination": data.get('destination'), "check_in": data.get('checkIn'), "check_out": data.get('checkOut')}
+            try:
+                # Go up 3 levels to find Card
+                card = p.locator('xpath=./ancestor::div[3]')
+                
+                # Visual Text Analysis for Name
+                name = await find_best_name(card)
+                price = await p.inner_text(timeout=1000)
+
+                item["hotel_name"] = name
+                item["price_numeric"] = extract_price(price)
+                item["price_display"] = price
+                item["hotel_img"] = await extract_image(card)
+                item["rating"] = await extract_rating(card)
+                item["amenities"] = await extract_amenities(card)
+                
+                if item.get("hotel_name") and item.get("price_numeric") and item["hotel_name"] not in seen:
+                    results.append(item)
+                    seen.add(item["hotel_name"])
+            except: continue
+    except: pass
+    if results: await context.push_data(results)
