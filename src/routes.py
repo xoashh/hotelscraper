@@ -7,6 +7,13 @@ import asyncio
 
 router = Router[PlaywrightCrawlingContext]()
 
+# --- PAGE HELPERS ---
+async def smooth_scroll(page, *, steps: int = 4, distance: int = 2000, delay_ms: int = 700):
+    """Scrolls the page in increments so lazy-loaded lists render cards consistently."""
+    for _ in range(steps):
+        await page.mouse.wheel(0, distance)
+        await page.wait_for_timeout(delay_ms)
+
 # --- UTILS ---
 def clean_text(text):
     if not text: return None
@@ -174,6 +181,16 @@ async def handle_mmt(context: PlaywrightCrawlingContext) -> None:
             pass
 
         # Prime the page by scrolling; cards load lazily.
+        await smooth_scroll(page, steps=5, distance=1800, delay_ms=900)
+
+        # Standard Selectors
+        cards = await page.locator('#hotelListingContainer .listingRowOuter, [id^="htl_id"], .listingRowOuter, .listingRow, [class*="HotelCard" i]').all()
+
+        # Fallback to Text Anchors if empty
+        if len(cards) == 0:
+            price_els = await page.locator('text=/₹|Rs|INR/').all()
+            # MMT nesting is deep, usually 4-6 divs up
+            cards = [p.locator('xpath=./ancestor::div[contains(@class,"listingRow") or contains(@class,"card")][1]') for p in price_els]
         await page.mouse.wheel(0, 4000)
         await page.wait_for_timeout(1500)
 
@@ -203,6 +220,11 @@ async def handle_mmt(context: PlaywrightCrawlingContext) -> None:
                     price = await card.locator('text=/₹/').first.inner_text(timeout=1000)
                 elif await card.locator('[class*="price" i]').count() > 0:
                     price = await card.locator('[class*="price" i]').first.inner_text(timeout=1000)
+                else:
+                    # Deep fallback: grab any rupee-prefixed substring from the card text
+                    raw_texts = await card.all_inner_texts()
+                    price_text = next((t for t in raw_texts if "₹" in t or "Rs" in t), "0")
+                    price = price_text
 
                 item["hotel_name"] = clean_text(name)
                 item["price_numeric"] = extract_price(price)
@@ -229,6 +251,34 @@ async def handle_cleartrip(context: PlaywrightCrawlingContext) -> None:
         await page.wait_for_load_state("domcontentloaded")
         if "Access Denied" in await page.content(): return
 
+        # Wait for either a hotel card or a rupee price to appear so we don't bail too early.
+        try:
+            await page.wait_for_selector('[data-testid="ResultCard"], [data-testid="hotelCard"], text=/₹|Rs|INR/', timeout=45000)
+        except:  # pragma: no cover - best effort before scrolling
+            pass
+
+        # Cleartrip uses virtualized lists; scroll generously to force first batch of cards.
+        await smooth_scroll(page, steps=8, distance=1400, delay_ms=600)
+
+        # Prefer structured cards; fall back to price anchors if the layout differs.
+        cards = await page.locator('[data-testid="ResultCard"], [data-testid="hotelCard"], [data-testid="HotelCard"], article, li:has([data-testid="hotelName"]), [class*="HotelCard" i], [class*="ResultCard" i]').all()
+
+        # If no cards resolved, use price anchors and walk up the tree to locate a container.
+        if len(cards) == 0:
+            price_els = await page.locator('text=/₹|Rs|INR/').all()
+            cards = []
+            for p in price_els:
+                fallback = None
+                for selector in [
+                    'xpath=./ancestor::article[1]',
+                    'xpath=./ancestor::li[1]',
+                    'xpath=./ancestor::div[contains(@class,"Card") or contains(@class,"result") or contains(@class,"hotel")][1]'
+                ]:
+                    candidate = p.locator(selector)
+                    if await candidate.count() > 0:
+                        fallback = candidate
+                        break
+                cards.append(fallback or p)
         # Prefer structured cards; fall back to price anchors if the layout differs.
         cards = await page.locator('[data-testid="ResultCard"], [data-testid="hotelCard"], article, [class*="HotelCard" i]').all()
 
@@ -253,6 +303,9 @@ async def handle_cleartrip(context: PlaywrightCrawlingContext) -> None:
                 price = None
                 if await price_locator.count() > 0:
                     price = await price_locator.first.inner_text(timeout=1000)
+                else:
+                    raw_texts = await card.all_inner_texts()
+                    price = next((t for t in raw_texts if "₹" in t or "Rs" in t or "INR" in t), None)
 
                 item["hotel_name"] = clean_text(name)
                 item["price_numeric"] = extract_price(price)
