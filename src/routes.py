@@ -191,6 +191,17 @@ async def handle_mmt(context: PlaywrightCrawlingContext) -> None:
             price_els = await page.locator('text=/₹|Rs|INR/').all()
             # MMT nesting is deep, usually 4-6 divs up
             cards = [p.locator('xpath=./ancestor::div[contains(@class,"listingRow") or contains(@class,"card")][1]') for p in price_els]
+        await page.mouse.wheel(0, 4000)
+        await page.wait_for_timeout(1500)
+
+        # Standard Selectors
+        cards = await page.locator('[id^="htl_id"], .listingRowOuter, .listingRow').all()
+
+        # Fallback to Text Anchors if empty
+        if len(cards) == 0:
+            price_els = await page.locator('text=/₹/').all()
+            # MMT nesting is deep, usually 4-6 divs up
+            cards = [p.locator('xpath=./ancestor::div[6]') for p in price_els]
 
         for card in cards[:25]:
             item = {"source": "MakeMyTrip", "destination": data.get('destination'), "check_in": data.get('checkIn'), "check_out": data.get('checkOut')}
@@ -268,6 +279,13 @@ async def handle_cleartrip(context: PlaywrightCrawlingContext) -> None:
                         fallback = candidate
                         break
                 cards.append(fallback or p)
+        # Prefer structured cards; fall back to price anchors if the layout differs.
+        cards = await page.locator('[data-testid="ResultCard"], [data-testid="hotelCard"], article, [class*="HotelCard" i]').all()
+
+        # If no cards resolved, use price anchors and walk up the tree to locate a container.
+        if len(cards) == 0:
+            price_els = await page.locator('text=/₹|Rs/').all()
+            cards = [p.locator('xpath=./ancestor::div[4]') for p in price_els]
 
         for card in cards:
             item = {"source": "Cleartrip", "destination": data.get('destination'), "check_in": data.get('checkIn'), "check_out": data.get('checkOut')}
