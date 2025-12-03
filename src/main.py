@@ -36,9 +36,8 @@ def build_yatra_url(dest, ci, co):
     return (
         f"https://hotel.yatra.com/nextui/hotel-search/dom/search?"
         f"checkinDate={quote(c_in)}&checkoutDate={quote(c_out)}&"
-        f"source=BOOKING_ENGINE&pg=1&tenant=PWA&isPersnldSrp=1&"
-        f"city.name={d}&city.code={d}&state.name={d}&state.code={d}&"
-        f"country.name=India&country.code=IND&"
+        f"source=BOOKING_ENGINE&pg=1&tenant=PWA&"
+        f"city.name={d}&city.code={d}&country.name=India&country.code=IND&"
         f"roomRequests%5B0%5D.id=1&roomRequests%5B0%5D.noOfAdults=2&roomRequests%5B0%5D.noOfChildren=0"
     )
 

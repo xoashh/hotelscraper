@@ -165,8 +165,14 @@ async def handle_mmt(context: PlaywrightCrawlingContext) -> None:
     seen = set()
     try:
         if "Access Denied" in await page.content(): return
-        try: await page.wait_for_selector('[id^="htl_id"]', timeout=15000)
-        except: pass
+
+        # Makemytrip sometimes renders into #hotelListingContainer first; fall back to
+        # the older id-based cards. Waiting for either prevents the handler from timing out.
+        try:
+            await page.wait_for_selector('#hotelListingContainer, [id^="htl_id"]', timeout=20000)
+        except:  # pragma: no cover - best effort
+            pass
+
         await page.mouse.wheel(0, 4000)
         
         # Standard Selectors
